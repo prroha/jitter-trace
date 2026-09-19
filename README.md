@@ -39,18 +39,31 @@ These counters move instead:
 
 One file, no dependencies. macOS only: it reads `vm_stat`, `iostat`, `ps` and `sysctl`, which all ship with the system.
 
+**Homebrew**
+
+```bash
+brew tap prroha/tap
+brew trust prroha/tap     # Homebrew 7 asks this of every third-party tap
+brew install jitter-trace
+```
+
+**Or copy the one file onto your PATH**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/prroha/jitter-trace/main/bin/jitter-trace \
   -o /usr/local/bin/jitter-trace && chmod +x /usr/local/bin/jitter-trace
-jitter-trace --help
 ```
 
-No write access to `/usr/local/bin`? Put it anywhere on your `PATH`, for example `~/bin`. Or clone and run it in place:
+No write access to `/usr/local/bin`? Put it anywhere on your `PATH`, such as `~/bin`.
+
+**Or clone and run it in place**
 
 ```bash
 git clone https://github.com/prroha/jitter-trace.git
 ./jitter-trace/bin/jitter-trace
 ```
+
+Check it works with `jitter-trace --help`.
 
 ## Use it
 
