@@ -37,15 +37,20 @@ These counters move instead:
 
 ## Install
 
-macOS only. Uses `vm_stat`, `iostat`, `ps` and `sysctl`, all of which ship with the system. No dependencies.
+One file, no dependencies. macOS only: it reads `vm_stat`, `iostat`, `ps` and `sysctl`, which all ship with the system.
 
 ```bash
-git clone https://github.com/prroha/jitter-trace.git
-sudo ln -s "$PWD/jitter-trace/bin/jitter-trace" /usr/local/bin/jitter-trace
+curl -fsSL https://raw.githubusercontent.com/prroha/jitter-trace/main/bin/jitter-trace \
+  -o /usr/local/bin/jitter-trace && chmod +x /usr/local/bin/jitter-trace
 jitter-trace --help
 ```
 
-Or run it in place: `./jitter-trace/bin/jitter-trace`. The symlink is followed, so `bin/` and `lib/` just need to stay together; if they don't, the tool says so and exits 3.
+No write access to `/usr/local/bin`? Put it anywhere on your `PATH`, for example `~/bin`. Or clone and run it in place:
+
+```bash
+git clone https://github.com/prroha/jitter-trace.git
+./jitter-trace/bin/jitter-trace
+```
 
 ## Use it
 
@@ -109,7 +114,7 @@ bash test/parse.test.sh   # 29 unit tests on fixture text, no Mac needed
 bash test/cli.test.sh     # 17 end-to-end tests: runs the tool, checks every format
 ```
 
-The parsing, rate arithmetic, classification and verdict logic live in `lib/parse.sh` so the unit tests can feed them recorded `vm_stat` and `iostat` output, including the two-disk layout that shifts iostat's columns and both spellings of the decompression counter.
+The tool is one self-contained file whose parsing, rate arithmetic, classification and verdict functions come first, so the unit tests source it and feed them recorded `vm_stat` and `iostat` output, including the two-disk layout that shifts iostat's columns and both spellings of the decompression counter. Sourcing it never starts a sampling run.
 
 ## License
 

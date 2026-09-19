@@ -9,25 +9,139 @@
 set -u
 
 VERSION="1.0.0"
-# Follow symlinks: an install like /usr/local/bin/jitter-trace -> repo/bin/…
-# must still find lib/parse.sh beside the real script.
-SELF="${BASH_SOURCE[0]}"
-while [ -L "$SELF" ]; do
-  LINK="$(readlink "$SELF")"
-  case "$LINK" in
-    /*) SELF="$LINK" ;;
-    *) SELF="$(dirname "$SELF")/$LINK" ;;
-  esac
-done
-HERE="$(cd "$(dirname "$SELF")" && pwd)"
-LIBRARY="$HERE/../lib/parse.sh"
-if [ ! -r "$LIBRARY" ]; then
-  printf "jitter-trace: cannot read %s. Keep bin/ and lib/ together.\n" "$LIBRARY" >&2
-  exit 3
-fi
-# shellcheck source-path=SCRIPTDIR
-# shellcheck source=../lib/parse.sh
-. "$LIBRARY"
+
+# ── parsing and classification. Pure functions: the tests source this file and
+# feed them recorded vm_stat and iostat output. Bash 3.2 compatible, because
+# that is what macOS ships.
+
+# Cumulative page counters from `vm_stat` output on stdin: "decomp pagein swapin".
+# The decompression counter was renamed: macOS 13 and earlier print
+# "Pages decompressed", macOS 14+ print "Decompressions". Read whichever exists,
+# and never match "Tagged decompressions", which counts something else.
+parse_vm_stat() {
+  awk '
+    /^Decompressions:/      { gsub(/\./, "", $2); decomp = $2 }
+    /^Pages decompressed:/  { gsub(/\./, "", $3); decomp = $3 }
+    /^Pageins:/             { gsub(/\./, "", $2); pagein = $2 }
+    /^Swapins:/             { gsub(/\./, "", $2); swapin = $2 }
+    END { print decomp + 0, pagein + 0, swapin + 0 }
+  '
+}
+
+# CPU busy percent from `iostat -c` output on stdin. The columns move with the
+# number of disks, so the user and system columns are found by header name.
+parse_iostat_busy() {
+  awk '
+    /[[:space:]]us[[:space:]]+sy[[:space:]]+id/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "us") { user_column = i }
+        if ($i == "sy") { system_column = i }
+      }
+      seen_header = 1
+      next
+    }
+    seen_header && NF >= 3 { last = $0 }
+    END {
+      if (user_column == 0 || last == "") { print ""; exit }
+      split(last, fields, /[[:space:]]+/)
+      offset = (fields[1] == "") ? 1 : 0
+      user = fields[user_column + offset]
+      system_time = fields[system_column + offset]
+      if (user !~ /^[0-9.]+$/ || system_time !~ /^[0-9.]+$/) { print ""; exit }
+      printf "%.0f", user + system_time
+    }
+  '
+}
+
+# "MM:SS.ss" or "HH:MM:SS.ss" (the `ps cputime` format) to seconds.
+parse_cputime() {
+  awk -F: '
+    {
+      if (NF == 3) { printf "%.2f", $1 * 3600 + $2 * 60 + $3 }
+      else if (NF == 2) { printf "%.2f", $1 * 60 + $2 }
+      else { printf "%.2f", 0 }
+    }
+  ' <<< "${1:-}"
+}
+
+# Counters reset on reboot, and a reset would otherwise read as a huge negative.
+delta() {
+  awk -v before="${1:-0}" -v after="${2:-0}" 'BEGIN { print (after >= before) ? after - before : 0 }'
+}
+
+megabytes() {
+  awk -v pages="${1:-0}" -v page_size="${2:-4096}" 'BEGIN { printf "%.3f", pages * page_size / 1048576 }'
+}
+
+per_second() {
+  awk -v amount="${1:-0}" -v seconds="${2:-1}" 'BEGIN { printf "%.3f", (seconds > 0) ? amount / seconds : 0 }'
+}
+
+# Rates carry three decimals so a single page still registers. Displays show
+# just enough of them that a small but real rate does not read as zero.
+display_rate() {
+  awk -v value="${1:-0}" 'BEGIN {
+    if (value == 0) { printf "0" }
+    else if (value >= 1) { printf "%.1f", value }
+    else if (value >= 0.01) { printf "%.2f", value }
+    else { printf "%.3f", value }
+  }'
+}
+
+above() {
+  awk -v value="${1:-0}" -v limit="${2:-0}" 'BEGIN { exit !(value > limit) }'
+}
+
+# What this sample means, as space-separated tags. Rates are per second, so
+# changing the sampling interval does not change what counts as a stall.
+classify_sample() {
+  decomp_mb_rate="$1"
+  pagein_mb_rate="$2"
+  swapin_mb_rate="$3"
+  windowserver_percent="$4"
+  decomp_limit="$5"
+  pagein_limit="$6"
+  windowserver_limit="$7"
+
+  tags=""
+  if above "$decomp_mb_rate" "$decomp_limit"; then
+    tags="${tags}MEMORY-STALL($(display_rate "$decomp_mb_rate")MB/s-decompressed) "
+  fi
+  if above "$pagein_mb_rate" "$pagein_limit"; then
+    tags="${tags}DISK-FAULT($(display_rate "$pagein_mb_rate")MB/s) "
+  fi
+  if above "$swapin_mb_rate" 0; then
+    tags="${tags}SWAP-IN($(display_rate "$swapin_mb_rate")MB/s) "
+  fi
+  if above "$windowserver_percent" "$windowserver_limit"; then
+    tags="${tags}COMPOSITOR-BUSY "
+  fi
+  printf "%s" "$tags"
+}
+
+# The verdict: which cause the numbers point at.
+summarize_verdict() {
+  memory_events="$1"
+  disk_events="$2"
+  swap_events="$3"
+  compositor_events="$4"
+
+  if [ "$memory_events" -gt 0 ] || [ "$swap_events" -gt 0 ]; then
+    printf "%s" "Memory pressure. The working set does not fit, so touched pages come back from the compressor or swap. Close apps, or add RAM."
+    return
+  fi
+  if [ "$disk_events" -gt 0 ]; then
+    printf "%s" "Disk faults. Pages are being read from disk. Check what is reading heavily, or whether the disk is nearly full."
+    return
+  fi
+  if [ "$compositor_events" -gt 0 ]; then
+    printf "%s" "Compositor. WindowServer is doing real work: animations, many windows, displays or scaled resolutions. Not a memory problem."
+    return
+  fi
+  printf "%s" "No stalls seen. Nothing here explains the jitter: look at the app itself, the GPU, or thermal throttling."
+}
+
+# ── the tool
 
 DEFAULT_INTERVAL=1
 DEFAULT_DECOMP_LIMIT=8
@@ -108,192 +222,199 @@ require_integer() {
   positive_integer "$2" || die "$1 expects a whole number, got $2"
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -i|--interval) shift; require_number "--interval" "${1:-}"; interval="$1" ;;
-    -d|--duration) shift; require_number "--duration" "${1:-}"; duration="$1" ;;
-    -n|--samples) shift; require_integer "--samples" "${1:-}"; samples="$1" ;;
-    --csv) format="csv" ;;
-    --json) format="json" ;;
-    --no-cpu) measure_cpu=0 ;;
-    --decomp-mb) shift; require_number "--decomp-mb" "${1:-}"; decomp_limit="$1" ;;
-    --pagein-mb) shift; require_number "--pagein-mb" "${1:-}"; pagein_limit="$1" ;;
-    --ws-percent) shift; require_number "--ws-percent" "${1:-}"; windowserver_limit="$1" ;;
-    -v|--version) printf "%s\n" "$VERSION"; exit 0 ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "unknown option: $1. Run jitter-trace --help." ;;
-  esac
-  shift
-done
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i|--interval) shift; require_number "--interval" "${1:-}"; interval="$1" ;;
+      -d|--duration) shift; require_number "--duration" "${1:-}"; duration="$1" ;;
+      -n|--samples) shift; require_integer "--samples" "${1:-}"; samples="$1" ;;
+      --csv) format="csv" ;;
+      --json) format="json" ;;
+      --no-cpu) measure_cpu=0 ;;
+      --decomp-mb) shift; require_number "--decomp-mb" "${1:-}"; decomp_limit="$1" ;;
+      --pagein-mb) shift; require_number "--pagein-mb" "${1:-}"; pagein_limit="$1" ;;
+      --ws-percent) shift; require_number "--ws-percent" "${1:-}"; windowserver_limit="$1" ;;
+      -v|--version) printf "%s\n" "$VERSION"; exit 0 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1. Run jitter-trace --help." ;;
+    esac
+    shift
+  done
 
-require_macos
+  require_macos
 
-page_size="$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)"
+  page_size="$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)"
 
-# Sub-second timing: macOS `date` has no %N, so ask perl, which ships with it.
-now() {
-  perl -MTime::HiRes=time -e 'printf "%.3f", time' 2>/dev/null || date +%s
-}
+  # Sub-second timing: macOS `date` has no %N, so ask perl, which ships with it.
+  now() {
+    perl -MTime::HiRes=time -e 'printf "%.3f", time' 2>/dev/null || date +%s
+  }
 
-windowserver_pid="$(pgrep -x WindowServer 2>/dev/null | head -1)"
-if [ -z "$windowserver_pid" ]; then
-  printf "jitter-trace: WindowServer is not running (headless or over SSH), so WS%% stays 0.\n" >&2
-fi
-
-windowserver_seconds() {
+  windowserver_pid="$(pgrep -x WindowServer 2>/dev/null | head -1)"
   if [ -z "$windowserver_pid" ]; then
-    printf "0"
-    return
+    printf "jitter-trace: WindowServer is not running (headless or over SSH), so WS%% stays 0.\n" >&2
   fi
-  parse_cputime "$(ps -o cputime= -p "$windowserver_pid" 2>/dev/null | tr -d ' ')"
-}
 
-cpu_busy_percent() {
-  if [ "$measure_cpu" -eq 0 ]; then
-    printf ""
-    return
-  fi
-  iostat -c 2 -w "$CPU_SAMPLE_SECONDS" 2>/dev/null | parse_iostat_busy
-}
+  windowserver_seconds() {
+    if [ -z "$windowserver_pid" ]; then
+      printf "0"
+      return
+    fi
+    parse_cputime "$(ps -o cputime= -p "$windowserver_pid" 2>/dev/null | tr -d ' ')"
+  }
 
-sample_count=0
-memory_events=0
-disk_events=0
-swap_events=0
-compositor_events=0
-worst_decomp=0
-worst_pagein=0
-worst_swapin=0
-worst_windowserver=0
+  cpu_busy_percent() {
+    if [ "$measure_cpu" -eq 0 ]; then
+      printf ""
+      return
+    fi
+    iostat -c 2 -w "$CPU_SAMPLE_SECONDS" 2>/dev/null | parse_iostat_busy
+  }
 
-track_worst() {
-  worst_decomp="$(awk -v a="$worst_decomp" -v b="$1" 'BEGIN { print (b > a) ? b : a }')"
-  worst_pagein="$(awk -v a="$worst_pagein" -v b="$2" 'BEGIN { print (b > a) ? b : a }')"
-  worst_swapin="$(awk -v a="$worst_swapin" -v b="$3" 'BEGIN { print (b > a) ? b : a }')"
-  worst_windowserver="$(awk -v a="$worst_windowserver" -v b="$4" 'BEGIN { print (b > a) ? b : a }')"
-}
+  sample_count=0
+  memory_events=0
+  disk_events=0
+  swap_events=0
+  compositor_events=0
+  worst_decomp=0
+  worst_pagein=0
+  worst_swapin=0
+  worst_windowserver=0
 
-print_summary() {
-  verdict="$(summarize_verdict "$memory_events" "$disk_events" "$swap_events" "$compositor_events")"
-  if [ "$format" = "json" ]; then
-    printf '{"type":"summary","samples":%d,"memory_stalls":%d,"disk_faults":%d,"swap_ins":%d,"compositor_busy":%d,"worst_decomp_mb_s":%s,"worst_pagein_mb_s":%s,"worst_swapin_mb_s":%s,"worst_windowserver_percent":%s,"verdict":"%s"}\n' \
-      "$sample_count" "$memory_events" "$disk_events" "$swap_events" "$compositor_events" \
-      "$worst_decomp" "$worst_pagein" "$worst_swapin" "$worst_windowserver" "$verdict"
-    return
-  fi
-  {
-    printf "\n%s samples over %ss intervals\n" "$sample_count" "$interval"
-    printf "  memory stalls    %s   (worst %s MB/s decompressed)\n" "$memory_events" "$(display_rate "$worst_decomp")"
-    printf "  disk faults      %s   (worst %s MB/s paged in)\n" "$disk_events" "$(display_rate "$worst_pagein")"
-    printf "  swap-ins         %s   (worst %s MB/s)\n" "$swap_events" "$(display_rate "$worst_swapin")"
-    printf "  compositor busy  %s   (WindowServer peaked at %s%%)\n" "$compositor_events" "$worst_windowserver"
-    printf "\n%s\n" "$verdict"
-  } >&2
-}
+  track_worst() {
+    worst_decomp="$(awk -v a="$worst_decomp" -v b="$1" 'BEGIN { print (b > a) ? b : a }')"
+    worst_pagein="$(awk -v a="$worst_pagein" -v b="$2" 'BEGIN { print (b > a) ? b : a }')"
+    worst_swapin="$(awk -v a="$worst_swapin" -v b="$3" 'BEGIN { print (b > a) ? b : a }')"
+    worst_windowserver="$(awk -v a="$worst_windowserver" -v b="$4" 'BEGIN { print (b > a) ? b : a }')"
+  }
 
-stop_requested=0
+  print_summary() {
+    verdict="$(summarize_verdict "$memory_events" "$disk_events" "$swap_events" "$compositor_events")"
+    if [ "$format" = "json" ]; then
+      printf '{"type":"summary","samples":%d,"memory_stalls":%d,"disk_faults":%d,"swap_ins":%d,"compositor_busy":%d,"worst_decomp_mb_s":%s,"worst_pagein_mb_s":%s,"worst_swapin_mb_s":%s,"worst_windowserver_percent":%s,"verdict":"%s"}\n' \
+        "$sample_count" "$memory_events" "$disk_events" "$swap_events" "$compositor_events" \
+        "$worst_decomp" "$worst_pagein" "$worst_swapin" "$worst_windowserver" "$verdict"
+      return
+    fi
+    {
+      printf "\n%s samples over %ss intervals\n" "$sample_count" "$interval"
+      printf "  memory stalls    %s   (worst %s MB/s decompressed)\n" "$memory_events" "$(display_rate "$worst_decomp")"
+      printf "  disk faults      %s   (worst %s MB/s paged in)\n" "$disk_events" "$(display_rate "$worst_pagein")"
+      printf "  swap-ins         %s   (worst %s MB/s)\n" "$swap_events" "$(display_rate "$worst_swapin")"
+      printf "  compositor busy  %s   (WindowServer peaked at %s%%)\n" "$compositor_events" "$worst_windowserver"
+      printf "\n%s\n" "$verdict"
+    } >&2
+  }
 
-on_exit() {
-  status=$?
-  trap - EXIT
-  print_summary
-  if [ "$stop_requested" -eq 1 ]; then
+  stop_requested=0
+
+  on_exit() {
+    status=$?
+    trap - EXIT
+    print_summary
+    if [ "$stop_requested" -eq 1 ]; then
+      exit 0
+    fi
+    exit "$status"
+  }
+
+  finish() {
+    stop_requested=1
     exit 0
-  fi
-  exit "$status"
+  }
+
+  trap finish INT TERM
+  trap on_exit EXIT
+
+  case "$format" in
+    table)
+      printf "%-8s %8s %8s %8s %6s %6s  %s\n" TIME DECOMP PAGEIN SWAPIN CPU% WS% NOTE
+      ;;
+    csv)
+      printf "time,decomp_pages,pagein_pages,swapin_pages,cpu_percent,ws_percent,decomp_mb_s,pagein_mb_s,swapin_mb_s,tags\n"
+      ;;
+  esac
+
+  previous_counters=""
+  previous_windowserver_seconds="$(windowserver_seconds)"
+  previous_time="$(now)"
+  started_at="$(now)"
+
+  while :; do
+    read -r decomp pagein swapin <<< "$(vm_stat | parse_vm_stat)"
+    cpu_percent="$(cpu_busy_percent)"
+    windowserver_now="$(windowserver_seconds)"
+    time_now="$(now)"
+    elapsed="$(awk -v a="$previous_time" -v b="$time_now" -v fallback="$interval" \
+      'BEGIN { e = b - a; print (e > 0.05) ? e : fallback }')"
+    windowserver_percent="$(awk -v a="$previous_windowserver_seconds" -v b="$windowserver_now" -v e="$elapsed" \
+      'BEGIN { printf "%.1f", (e > 0) ? (b - a) * 100 / e : 0 }')"
+    previous_windowserver_seconds="$windowserver_now"
+    previous_time="$time_now"
+
+    if [ -n "$previous_counters" ]; then
+      read -r previous_decomp previous_pagein previous_swapin <<< "$previous_counters"
+      decomp_pages="$(delta "$previous_decomp" "$decomp")"
+      pagein_pages="$(delta "$previous_pagein" "$pagein")"
+      swapin_pages="$(delta "$previous_swapin" "$swapin")"
+      decomp_rate="$(per_second "$(megabytes "$decomp_pages" "$page_size")" "$elapsed")"
+      pagein_rate="$(per_second "$(megabytes "$pagein_pages" "$page_size")" "$elapsed")"
+      swapin_rate="$(per_second "$(megabytes "$swapin_pages" "$page_size")" "$elapsed")"
+      tags="$(classify_sample "$decomp_rate" "$pagein_rate" "$swapin_rate" "$windowserver_percent" \
+        "$decomp_limit" "$pagein_limit" "$windowserver_limit")"
+
+      case "$tags" in
+        *MEMORY-STALL*) memory_events=$((memory_events + 1)) ;;
+      esac
+      case "$tags" in
+        *DISK-FAULT*) disk_events=$((disk_events + 1)) ;;
+      esac
+      case "$tags" in
+        *SWAP-IN*) swap_events=$((swap_events + 1)) ;;
+      esac
+      case "$tags" in
+        *COMPOSITOR-BUSY*) compositor_events=$((compositor_events + 1)) ;;
+      esac
+      track_worst "$decomp_rate" "$pagein_rate" "$swapin_rate" "$windowserver_percent"
+      sample_count=$((sample_count + 1))
+
+      case "$format" in
+        table)
+          printf "%-8s %8d %8d %8d %5s%% %5s%%  %s\n" "$(date +%H:%M:%S)" \
+            "$decomp_pages" "$pagein_pages" "$swapin_pages" "${cpu_percent:--}" "$windowserver_percent" "$tags"
+          ;;
+        csv)
+          printf "%s,%d,%d,%d,%s,%s,%s,%s,%s,%s\n" "$(date +%H:%M:%S)" \
+            "$decomp_pages" "$pagein_pages" "$swapin_pages" "$cpu_percent" "$windowserver_percent" \
+            "$decomp_rate" "$pagein_rate" "$swapin_rate" "$(printf "%s" "$tags" | tr -s ' ' ';' | sed 's/;$//')"
+          ;;
+        json)
+          printf '{"type":"sample","time":"%s","decomp_pages":%d,"pagein_pages":%d,"swapin_pages":%d,"cpu_percent":%s,"ws_percent":%s,"decomp_mb_s":%s,"pagein_mb_s":%s,"swapin_mb_s":%s,"tags":"%s"}\n' \
+            "$(date +%H:%M:%S)" "$decomp_pages" "$pagein_pages" "$swapin_pages" \
+            "${cpu_percent:-null}" "$windowserver_percent" "$decomp_rate" "$pagein_rate" "$swapin_rate" \
+            "$(printf "%s" "$tags" | sed 's/ *$//')"
+          ;;
+      esac
+    fi
+    previous_counters="$decomp $pagein $swapin"
+
+    if [ -n "$samples" ] && [ "$sample_count" -ge "$samples" ]; then
+      finish
+    fi
+    if [ -n "$duration" ] && awk -v s="$started_at" -v n="$(now)" -v d="$duration" 'BEGIN { exit !(n - s >= d) }'; then
+      finish
+    fi
+
+    # iostat already spent about a second of the interval.
+    remaining="$(awk -v i="$interval" -v spent="$([ "$measure_cpu" -eq 1 ] && echo "$CPU_SAMPLE_SECONDS" || echo 0)" \
+      'BEGIN { r = i - spent; print (r > 0) ? r : 0 }')"
+    if awk -v r="$remaining" 'BEGIN { exit !(r > 0) }'; then
+      sleep "$remaining"
+    fi
+  done
 }
 
-finish() {
-  stop_requested=1
-  exit 0
-}
-
-trap finish INT TERM
-trap on_exit EXIT
-
-case "$format" in
-  table)
-    printf "%-8s %8s %8s %8s %6s %6s  %s\n" TIME DECOMP PAGEIN SWAPIN CPU% WS% NOTE
-    ;;
-  csv)
-    printf "time,decomp_pages,pagein_pages,swapin_pages,cpu_percent,ws_percent,decomp_mb_s,pagein_mb_s,swapin_mb_s,tags\n"
-    ;;
-esac
-
-previous_counters=""
-previous_windowserver_seconds="$(windowserver_seconds)"
-previous_time="$(now)"
-started_at="$(now)"
-
-while :; do
-  read -r decomp pagein swapin <<< "$(vm_stat | parse_vm_stat)"
-  cpu_percent="$(cpu_busy_percent)"
-  windowserver_now="$(windowserver_seconds)"
-  time_now="$(now)"
-  elapsed="$(awk -v a="$previous_time" -v b="$time_now" -v fallback="$interval" \
-    'BEGIN { e = b - a; print (e > 0.05) ? e : fallback }')"
-  windowserver_percent="$(awk -v a="$previous_windowserver_seconds" -v b="$windowserver_now" -v e="$elapsed" \
-    'BEGIN { printf "%.1f", (e > 0) ? (b - a) * 100 / e : 0 }')"
-  previous_windowserver_seconds="$windowserver_now"
-  previous_time="$time_now"
-
-  if [ -n "$previous_counters" ]; then
-    read -r previous_decomp previous_pagein previous_swapin <<< "$previous_counters"
-    decomp_pages="$(delta "$previous_decomp" "$decomp")"
-    pagein_pages="$(delta "$previous_pagein" "$pagein")"
-    swapin_pages="$(delta "$previous_swapin" "$swapin")"
-    decomp_rate="$(per_second "$(megabytes "$decomp_pages" "$page_size")" "$elapsed")"
-    pagein_rate="$(per_second "$(megabytes "$pagein_pages" "$page_size")" "$elapsed")"
-    swapin_rate="$(per_second "$(megabytes "$swapin_pages" "$page_size")" "$elapsed")"
-    tags="$(classify_sample "$decomp_rate" "$pagein_rate" "$swapin_rate" "$windowserver_percent" \
-      "$decomp_limit" "$pagein_limit" "$windowserver_limit")"
-
-    case "$tags" in
-      *MEMORY-STALL*) memory_events=$((memory_events + 1)) ;;
-    esac
-    case "$tags" in
-      *DISK-FAULT*) disk_events=$((disk_events + 1)) ;;
-    esac
-    case "$tags" in
-      *SWAP-IN*) swap_events=$((swap_events + 1)) ;;
-    esac
-    case "$tags" in
-      *COMPOSITOR-BUSY*) compositor_events=$((compositor_events + 1)) ;;
-    esac
-    track_worst "$decomp_rate" "$pagein_rate" "$swapin_rate" "$windowserver_percent"
-    sample_count=$((sample_count + 1))
-
-    case "$format" in
-      table)
-        printf "%-8s %8d %8d %8d %5s%% %5s%%  %s\n" "$(date +%H:%M:%S)" \
-          "$decomp_pages" "$pagein_pages" "$swapin_pages" "${cpu_percent:--}" "$windowserver_percent" "$tags"
-        ;;
-      csv)
-        printf "%s,%d,%d,%d,%s,%s,%s,%s,%s,%s\n" "$(date +%H:%M:%S)" \
-          "$decomp_pages" "$pagein_pages" "$swapin_pages" "$cpu_percent" "$windowserver_percent" \
-          "$decomp_rate" "$pagein_rate" "$swapin_rate" "$(printf "%s" "$tags" | tr -s ' ' ';' | sed 's/;$//')"
-        ;;
-      json)
-        printf '{"type":"sample","time":"%s","decomp_pages":%d,"pagein_pages":%d,"swapin_pages":%d,"cpu_percent":%s,"ws_percent":%s,"decomp_mb_s":%s,"pagein_mb_s":%s,"swapin_mb_s":%s,"tags":"%s"}\n' \
-          "$(date +%H:%M:%S)" "$decomp_pages" "$pagein_pages" "$swapin_pages" \
-          "${cpu_percent:-null}" "$windowserver_percent" "$decomp_rate" "$pagein_rate" "$swapin_rate" \
-          "$(printf "%s" "$tags" | sed 's/ *$//')"
-        ;;
-    esac
-  fi
-  previous_counters="$decomp $pagein $swapin"
-
-  if [ -n "$samples" ] && [ "$sample_count" -ge "$samples" ]; then
-    finish
-  fi
-  if [ -n "$duration" ] && awk -v s="$started_at" -v n="$(now)" -v d="$duration" 'BEGIN { exit !(n - s >= d) }'; then
-    finish
-  fi
-
-  # iostat already spent about a second of the interval.
-  remaining="$(awk -v i="$interval" -v spent="$([ "$measure_cpu" -eq 1 ] && echo "$CPU_SAMPLE_SECONDS" || echo 0)" \
-    'BEGIN { r = i - spent; print (r > 0) ? r : 0 }')"
-  if awk -v r="$remaining" 'BEGIN { exit !(r > 0) }'; then
-    sleep "$remaining"
-  fi
-done
+# Sourced by the tests for the functions above; run only when executed.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

@@ -4,9 +4,11 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The tool is one self-contained file; sourcing it defines the functions
+# without starting a sampling run.
 # shellcheck source-path=SCRIPTDIR
-# shellcheck source=../lib/parse.sh
-. "$HERE/../lib/parse.sh"
+# shellcheck source=../bin/jitter-trace
+. "$HERE/../bin/jitter-trace"
 
 pass=0
 fail=0
