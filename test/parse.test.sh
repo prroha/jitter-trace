@@ -4,6 +4,7 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/parse.sh
 . "$HERE/../lib/parse.sh"
 

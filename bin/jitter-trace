@@ -25,6 +25,7 @@ if [ ! -r "$LIBRARY" ]; then
   printf "jitter-trace: cannot read %s. Keep bin/ and lib/ together.\n" "$LIBRARY" >&2
   exit 3
 fi
+# shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/parse.sh
 . "$LIBRARY"
 
