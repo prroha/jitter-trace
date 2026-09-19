@@ -129,6 +129,15 @@ bash test/cli.test.sh     # 17 end-to-end tests: runs the tool, checks every for
 
 The tool is one self-contained file whose parsing, rate arithmetic, classification and verdict functions come first, so the unit tests source it and feed them recorded `vm_stat` and `iostat` output, including the two-disk layout that shifts iostat's columns and both spellings of the decompression counter. Sourcing it never starts a sampling run.
 
+## Releasing (for me)
+
+```bash
+scripts/release.sh patch --dry-run   # say what would happen
+scripts/release.sh patch             # or minor, major, or 1.2.3
+```
+
+It refuses unless you are on a clean `main` that matches origin and both suites pass, then bumps `VERSION`, tags, publishes the GitHub release, checksums the tarball and points the Homebrew formula at it. Set `TAP_DIR` if the tap is not beside this repository.
+
 ## License
 
 MIT
