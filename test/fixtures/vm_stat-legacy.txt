@@ -1,0 +1,7 @@
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                                  100000.
+Pageins:                                    5000000.
+Pageouts:                                     10000.
+Swapins:                                      20000.
+Swapouts:                                     30000.
+Pages decompressed:                          900000.
