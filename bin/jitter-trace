@@ -18,13 +18,20 @@ VERSION="1.0.0"
 # The decompression counter was renamed: macOS 13 and earlier print
 # "Pages decompressed", macOS 14+ print "Decompressions". Read whichever exists,
 # and never match "Tagged decompressions", which counts something else.
+# A counter that is not there at all prints as "-", never as 0: if Apple renames
+# one again, the tool has to say it cannot tell rather than report a calm machine.
 parse_vm_stat() {
   awk '
     /^Decompressions:/      { gsub(/\./, "", $2); decomp = $2 }
     /^Pages decompressed:/  { gsub(/\./, "", $3); decomp = $3 }
     /^Pageins:/             { gsub(/\./, "", $2); pagein = $2 }
     /^Swapins:/             { gsub(/\./, "", $2); swapin = $2 }
-    END { print decomp + 0, pagein + 0, swapin + 0 }
+    END {
+      if (decomp == "") { decomp = "-" }
+      if (pagein == "") { pagein = "-" }
+      if (swapin == "") { swapin = "-" }
+      print decomp, pagein, swapin
+    }
   '
 }
 
@@ -94,48 +101,58 @@ above() {
 
 # What this sample means, as space-separated tags. Rates are per second, so
 # changing the sampling interval does not change what counts as a stall.
+# Its working variables are local and named apart from the caller's, so a call
+# site that passes anything but the run's own thresholds cannot overwrite them.
 classify_sample() {
-  decomp_mb_rate="$1"
-  pagein_mb_rate="$2"
-  swapin_mb_rate="$3"
-  windowserver_percent="$4"
-  decomp_limit="$5"
-  pagein_limit="$6"
-  windowserver_limit="$7"
+  local decomp_mb_rate="$1"
+  local pagein_mb_rate="$2"
+  local swapin_mb_rate="$3"
+  local windowserver_cpu_percent="$4"
+  local decomp_rate_limit="$5"
+  local pagein_rate_limit="$6"
+  local windowserver_rate_limit="$7"
+  local sample_tags=""
 
-  tags=""
-  if above "$decomp_mb_rate" "$decomp_limit"; then
-    tags="${tags}MEMORY-STALL($(display_rate "$decomp_mb_rate")MB/s-decompressed) "
+  if above "$decomp_mb_rate" "$decomp_rate_limit"; then
+    sample_tags="${sample_tags}MEMORY-STALL($(display_rate "$decomp_mb_rate")MB/s-decompressed) "
   fi
-  if above "$pagein_mb_rate" "$pagein_limit"; then
-    tags="${tags}DISK-FAULT($(display_rate "$pagein_mb_rate")MB/s) "
+  if above "$pagein_mb_rate" "$pagein_rate_limit"; then
+    sample_tags="${sample_tags}DISK-FAULT($(display_rate "$pagein_mb_rate")MB/s) "
   fi
   if above "$swapin_mb_rate" 0; then
-    tags="${tags}SWAP-IN($(display_rate "$swapin_mb_rate")MB/s) "
+    sample_tags="${sample_tags}SWAP-IN($(display_rate "$swapin_mb_rate")MB/s) "
   fi
-  if above "$windowserver_percent" "$windowserver_limit"; then
-    tags="${tags}COMPOSITOR-BUSY "
+  if above "$windowserver_cpu_percent" "$windowserver_rate_limit"; then
+    sample_tags="${sample_tags}COMPOSITOR-BUSY "
   fi
-  printf "%s" "$tags"
+  printf "%s" "$sample_tags"
 }
 
-# The verdict: which cause the numbers point at.
+# The verdict: which cause the numbers point at. Counts are read from the
+# arguments into locals of their own, so a caller's tallies are never touched.
+# The last argument is how many samples had no readable counters at all: quiet
+# is only evidence of calm when the counters were actually read.
 summarize_verdict() {
-  memory_events="$1"
-  disk_events="$2"
-  swap_events="$3"
-  compositor_events="$4"
+  local memory_count="$1"
+  local disk_count="$2"
+  local swap_count="$3"
+  local compositor_count="$4"
+  local unreadable_count="${5:-0}"
 
-  if [ "$memory_events" -gt 0 ] || [ "$swap_events" -gt 0 ]; then
+  if [ "$memory_count" -gt 0 ] || [ "$swap_count" -gt 0 ]; then
     printf "%s" "Memory pressure. The working set does not fit, so touched pages come back from the compressor or swap. Close apps, or add RAM."
     return
   fi
-  if [ "$disk_events" -gt 0 ]; then
+  if [ "$disk_count" -gt 0 ]; then
     printf "%s" "Disk faults. Pages are being read from disk. Check what is reading heavily, or whether the disk is nearly full."
     return
   fi
-  if [ "$compositor_events" -gt 0 ]; then
+  if [ "$compositor_count" -gt 0 ]; then
     printf "%s" "Compositor. WindowServer is doing real work: animations, many windows, displays or scaled resolutions. Not a memory problem."
+    return
+  fi
+  if [ "$unreadable_count" -gt 0 ]; then
+    printf "%s" "Nothing was measured. vm_stat did not print the counters this tool reads, so no stall could be seen or ruled out. Check vm_stat output against this version of macOS."
     return
   fi
   printf "%s" "No stalls seen. Nothing here explains the jitter: look at the app itself, the GPU, or thermal throttling."
@@ -199,11 +216,17 @@ die() {
   exit "${2:-1}"
 }
 
+# The two tools with no fallback: vm_stat is every counter, awk is every
+# calculation. iostat, ps, pgrep, perl and sysctl are all allowed to be missing
+# because each one degrades to a "cannot tell" value instead of a wrong one.
 require_macos() {
+  local required_tool
   if [ "$(uname -s)" != "Darwin" ]; then
     die "this tool reads macOS counters (vm_stat, WindowServer) and only runs on macOS." 3
   fi
-  command -v vm_stat >/dev/null 2>&1 || die "vm_stat not found." 3
+  for required_tool in vm_stat awk; do
+    command -v "$required_tool" >/dev/null 2>&1 || die "$required_tool not found." 3
+  done
 }
 
 positive_number() {
@@ -243,6 +266,11 @@ main() {
 
   require_macos
 
+  if [ "$measure_cpu" -eq 1 ] && awk -v i="$interval" -v wait="$CPU_SAMPLE_SECONDS" 'BEGIN { exit !(i < wait) }'; then
+    printf "jitter-trace: --interval %s cannot be honoured while CPU%% is measured, because iostat blocks for about %ss. Add --no-cpu for a tighter interval.\n" \
+      "$interval" "$CPU_SAMPLE_SECONDS" >&2
+  fi
+
   page_size="$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)"
 
   # Sub-second timing: macOS `date` has no %N, so ask perl, which ships with it.
@@ -272,6 +300,8 @@ main() {
   }
 
   sample_count=0
+  unreadable_samples=0
+  warned_unreadable=0
   memory_events=0
   disk_events=0
   swap_events=0
@@ -289,10 +319,10 @@ main() {
   }
 
   print_summary() {
-    verdict="$(summarize_verdict "$memory_events" "$disk_events" "$swap_events" "$compositor_events")"
+    verdict="$(summarize_verdict "$memory_events" "$disk_events" "$swap_events" "$compositor_events" "$unreadable_samples")"
     if [ "$format" = "json" ]; then
-      printf '{"type":"summary","samples":%d,"memory_stalls":%d,"disk_faults":%d,"swap_ins":%d,"compositor_busy":%d,"worst_decomp_mb_s":%s,"worst_pagein_mb_s":%s,"worst_swapin_mb_s":%s,"worst_windowserver_percent":%s,"verdict":"%s"}\n' \
-        "$sample_count" "$memory_events" "$disk_events" "$swap_events" "$compositor_events" \
+      printf '{"type":"summary","samples":%d,"unreadable_samples":%d,"memory_stalls":%d,"disk_faults":%d,"swap_ins":%d,"compositor_busy":%d,"worst_decomp_mb_s":%s,"worst_pagein_mb_s":%s,"worst_swapin_mb_s":%s,"worst_windowserver_percent":%s,"verdict":"%s"}\n' \
+        "$sample_count" "$unreadable_samples" "$memory_events" "$disk_events" "$swap_events" "$compositor_events" \
         "$worst_decomp" "$worst_pagein" "$worst_swapin" "$worst_windowserver" "$verdict"
       return
     fi
@@ -301,7 +331,10 @@ main() {
       printf "  memory stalls    %s   (worst %s MB/s decompressed)\n" "$memory_events" "$(display_rate "$worst_decomp")"
       printf "  disk faults      %s   (worst %s MB/s paged in)\n" "$disk_events" "$(display_rate "$worst_pagein")"
       printf "  swap-ins         %s   (worst %s MB/s)\n" "$swap_events" "$(display_rate "$worst_swapin")"
-      printf "  compositor busy  %s   (WindowServer peaked at %s%%)\n" "$compositor_events" "$worst_windowserver"
+      printf "  compositor busy  %s   (WindowServer peaked at %s%%)\n" "$compositor_events" "$(display_rate "$worst_windowserver")"
+      if [ "$unreadable_samples" -gt 0 ]; then
+        printf "  unreadable       %s   (vm_stat did not print the counters)\n" "$unreadable_samples"
+      fi
       printf "\n%s\n" "$verdict"
     } >&2
   }
@@ -338,13 +371,18 @@ main() {
   previous_counters=""
   previous_windowserver_seconds="$(windowserver_seconds)"
   previous_time="$(now)"
-  started_at="$(now)"
+  # --duration covers the sampling, so the clock starts at the first reading,
+  # not before the setup that precedes it.
+  started_at=""
 
   while :; do
     read -r decomp pagein swapin <<< "$(vm_stat | parse_vm_stat)"
     cpu_percent="$(cpu_busy_percent)"
     windowserver_now="$(windowserver_seconds)"
     time_now="$(now)"
+    if [ -z "$started_at" ]; then
+      started_at="$time_now"
+    fi
     elapsed="$(awk -v a="$previous_time" -v b="$time_now" -v fallback="$interval" \
       'BEGIN { e = b - a; print (e > 0.05) ? e : fallback }')"
     windowserver_percent="$(awk -v a="$previous_windowserver_seconds" -v b="$windowserver_now" -v e="$elapsed" \
@@ -352,7 +390,31 @@ main() {
     previous_windowserver_seconds="$windowserver_now"
     previous_time="$time_now"
 
-    if [ -n "$previous_counters" ]; then
+    # A counter parse_vm_stat could not find reads as "-". Rates cannot be
+    # computed from it, and reporting it as no activity would invent the calm
+    # this tool exists to disprove.
+    case "$decomp $pagein $swapin" in
+      *-*) counters_readable=0 ;;
+      *) counters_readable=1 ;;
+    esac
+    if [ "$counters_readable" -eq 0 ] && [ "$warned_unreadable" -eq 0 ]; then
+      printf "jitter-trace: vm_stat did not print the counters this tool reads, so the page columns are unknown.\n" >&2
+      warned_unreadable=1
+    fi
+
+    row_ready=0
+    if [ "$counters_readable" -eq 0 ]; then
+      decomp_pages=""
+      pagein_pages=""
+      swapin_pages=""
+      decomp_rate=""
+      pagein_rate=""
+      swapin_rate=""
+      tags=""
+      unreadable_samples=$((unreadable_samples + 1))
+      sample_count=$((sample_count + 1))
+      row_ready=1
+    elif [ -n "$previous_counters" ]; then
       read -r previous_decomp previous_pagein previous_swapin <<< "$previous_counters"
       decomp_pages="$(delta "$previous_decomp" "$decomp")"
       pagein_pages="$(delta "$previous_pagein" "$pagein")"
@@ -377,26 +439,36 @@ main() {
       esac
       track_worst "$decomp_rate" "$pagein_rate" "$swapin_rate" "$windowserver_percent"
       sample_count=$((sample_count + 1))
+      row_ready=1
+    fi
 
+    if [ "$row_ready" -eq 1 ]; then
       case "$format" in
         table)
-          printf "%-8s %8d %8d %8d %5s%% %5s%%  %s\n" "$(date +%H:%M:%S)" \
-            "$decomp_pages" "$pagein_pages" "$swapin_pages" "${cpu_percent:--}" "$windowserver_percent" "$tags"
+          printf "%-8s %8s %8s %8s %5s%% %5s%%  %s\n" "$(date +%H:%M:%S)" \
+            "${decomp_pages:--}" "${pagein_pages:--}" "${swapin_pages:--}" \
+            "${cpu_percent:--}" "$windowserver_percent" "$tags"
           ;;
         csv)
-          printf "%s,%d,%d,%d,%s,%s,%s,%s,%s,%s\n" "$(date +%H:%M:%S)" \
+          printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" "$(date +%H:%M:%S)" \
             "$decomp_pages" "$pagein_pages" "$swapin_pages" "$cpu_percent" "$windowserver_percent" \
             "$decomp_rate" "$pagein_rate" "$swapin_rate" "$(printf "%s" "$tags" | tr -s ' ' ';' | sed 's/;$//')"
           ;;
         json)
-          printf '{"type":"sample","time":"%s","decomp_pages":%d,"pagein_pages":%d,"swapin_pages":%d,"cpu_percent":%s,"ws_percent":%s,"decomp_mb_s":%s,"pagein_mb_s":%s,"swapin_mb_s":%s,"tags":"%s"}\n' \
-            "$(date +%H:%M:%S)" "$decomp_pages" "$pagein_pages" "$swapin_pages" \
-            "${cpu_percent:-null}" "$windowserver_percent" "$decomp_rate" "$pagein_rate" "$swapin_rate" \
+          printf '{"type":"sample","time":"%s","decomp_pages":%s,"pagein_pages":%s,"swapin_pages":%s,"cpu_percent":%s,"ws_percent":%s,"decomp_mb_s":%s,"pagein_mb_s":%s,"swapin_mb_s":%s,"tags":"%s"}\n' \
+            "$(date +%H:%M:%S)" "${decomp_pages:-null}" "${pagein_pages:-null}" "${swapin_pages:-null}" \
+            "${cpu_percent:-null}" "$windowserver_percent" \
+            "${decomp_rate:-null}" "${pagein_rate:-null}" "${swapin_rate:-null}" \
             "$(printf "%s" "$tags" | sed 's/ *$//')"
           ;;
       esac
     fi
-    previous_counters="$decomp $pagein $swapin"
+
+    if [ "$counters_readable" -eq 1 ]; then
+      previous_counters="$decomp $pagein $swapin"
+    else
+      previous_counters=""
+    fi
 
     if [ -n "$samples" ] && [ "$sample_count" -ge "$samples" ]; then
       finish

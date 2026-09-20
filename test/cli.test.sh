@@ -106,6 +106,32 @@ else
   fail=$((fail + 1))
 fi
 
+# The clock has to start at the first reading, not a whole iteration earlier:
+# with iostat in the loop that difference costs a third of the requested run.
+duration_rows="$("$TRACE" --duration 3 --interval 1 --csv 2>/dev/null | grep -vc "^time,")"
+if [ "$duration_rows" -ge 3 ]; then
+  printf "  ok    --duration 3 --interval 1 samples for the full duration (%s rows)\n" "$duration_rows"
+  pass=$((pass + 1))
+else
+  printf "  FAIL  --duration 3 --interval 1 gave %s rows, expected at least 3\n" "$duration_rows"
+  fail=$((fail + 1))
+fi
+
+echo "warnings"
+check "warns that iostat cannot honour a sub-second interval" "cannot be honoured" \
+  "$("$TRACE" --interval 0.5 --samples 1 2>&1 >/dev/null)"
+quiet_interval="$("$TRACE" --interval 0.5 --samples 1 --no-cpu 2>&1 >/dev/null | grep -c "cannot be honoured")"
+check_code "stays quiet about the interval when the cpu sampler is off" 0 "$quiet_interval"
+
+echo "unreadable counters"
+fake_tools="$(mktemp -d)"
+printf '#!/bin/sh\nprintf "nothing useful\\n"\n' > "$fake_tools/vm_stat"
+chmod +x "$fake_tools/vm_stat"
+unreadable="$(PATH="$fake_tools:$PATH" "$TRACE" --samples 1 --interval 1 --no-cpu 2>&1)"
+rm -rf "$fake_tools"
+check "says so when vm_stat stops printing the counters" "did not print the counters" "$unreadable"
+check "and does not report a calm machine" "Nothing was measured" "$unreadable"
+
 echo
 printf "passed: %s   failed: %s\n" "$pass" "$fail"
 [ "$fail" -eq 0 ]

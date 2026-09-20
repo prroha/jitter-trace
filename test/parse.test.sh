@@ -49,7 +49,10 @@ expect "reads the macOS 13 and earlier names" "900000 5000000 20000" \
   "$(parse_vm_stat < "$HERE/fixtures/vm_stat-legacy.txt")"
 expect "ignores tagged decompressions" "1030423909 99589699 6315219" \
   "$(parse_vm_stat < "$HERE/fixtures/vm_stat.txt")"
-expect "reports zeros for unrecognised output" "0 0 0" "$(printf "nothing useful\n" | parse_vm_stat)"
+expect "a counter that is not there reads as unknown, not as zero" "- - -" \
+  "$(printf "nothing useful\n" | parse_vm_stat)"
+expect "a renamed decompression counter does not fake a quiet machine" "- 99589699 6315219" \
+  "$(grep -v -i decompressions "$HERE/fixtures/vm_stat.txt" | parse_vm_stat)"
 
 echo "iostat"
 expect "finds the cpu columns with one disk" "8" \
@@ -84,12 +87,37 @@ expect "header-only iostat reports an unknown cpu, not an idle one" "" \
 expect_contains "flags a busy compositor" "COMPOSITOR-BUSY" "$(classify_sample 0 0 0 94 8 2 60)"
 expect_contains "respects a raised limit" "" "$(classify_sample 20 0 0 0 50 2 60)"
 
+echo "no function writes to the caller's variables"
+decomp_limit="$DEFAULT_DECOMP_LIMIT"
+pagein_limit="$DEFAULT_PAGEIN_LIMIT"
+windowserver_limit="$DEFAULT_WINDOWSERVER_LIMIT"
+tags="untouched"
+classify_sample 20 9 1 94 50 40 90 >/dev/null
+expect "classify_sample leaves the decompression limit alone" "8" "$decomp_limit"
+expect "classify_sample leaves the page-in limit alone" "2" "$pagein_limit"
+expect "classify_sample leaves the WindowServer limit alone" "60" "$windowserver_limit"
+expect "classify_sample leaves the caller's tags alone" "untouched" "$tags"
+
+memory_events=7
+disk_events=7
+swap_events=7
+compositor_events=7
+summarize_verdict 0 0 0 0 >/dev/null
+expect "summarize_verdict leaves the memory count alone" "7" "$memory_events"
+expect "summarize_verdict leaves the disk count alone" "7" "$disk_events"
+expect "summarize_verdict leaves the swap count alone" "7" "$swap_events"
+expect "summarize_verdict leaves the compositor count alone" "7" "$compositor_events"
+
 echo "verdict"
 expect_contains "memory comes first" "Memory pressure" "$(summarize_verdict 2 1 0 1)"
 expect_contains "swap counts as memory" "Memory pressure" "$(summarize_verdict 0 0 1 0)"
 expect_contains "then disk" "Disk faults" "$(summarize_verdict 0 3 0 1)"
 expect_contains "then the compositor" "Compositor" "$(summarize_verdict 0 0 0 2)"
 expect_contains "nothing seen says so" "No stalls seen" "$(summarize_verdict 0 0 0 0)"
+expect_contains "unreadable counters are not reported as calm" "Nothing was measured" \
+  "$(summarize_verdict 0 0 0 0 4)"
+expect_contains "a stall still wins over unreadable samples" "Memory pressure" \
+  "$(summarize_verdict 1 0 0 0 4)"
 
 echo
 printf "passed: %s   failed: %s\n" "$pass" "$fail"

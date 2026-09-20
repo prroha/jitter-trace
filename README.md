@@ -108,13 +108,14 @@ An idle machine reads near zero on every counter, so a baseline run is worth hav
 
 Thresholds are **per second**, so changing `--interval` doesn't change what counts as a stall.
 
-Exit codes: `0` finished · `1` bad usage · `3` not macOS, or a required tool is missing.
+Exit codes: `0` finished · `1` bad usage · `3` not macOS, or `vm_stat` or `awk` is missing. Nothing else is required: `iostat`, `ps`, `pgrep`, `perl` and `sysctl` may all be absent, and the values they would have supplied read as unknown rather than as zero.
 
 ## Notes and limitations
 
 - **macOS only**, by nature: these are macOS counters. On anything else it says so and exits 3.
 - **The decompression counter was renamed.** macOS 13 and earlier print `Pages decompressed`; macOS 14+ print `Decompressions`. Both are read, so the column works across versions. (Scripts that only look for the old name silently report zero on modern macOS.)
-- **`iostat` costs about a second** per sample for its CPU figure, so an interval below ~1s only takes effect with `--no-cpu`.
+- **`iostat` costs about a second** per sample for its CPU figure, so an interval below ~1s only takes effect with `--no-cpu`. Ask for one anyway and the tool says on stderr that it cannot honour it.
+- **A counter it cannot find is reported as unknown, not as zero.** If a future macOS renames one of these counters, the columns show `-` (empty in CSV, `null` in JSON) and the summary says nothing was measured. Silence from this tool is only ever evidence of calm when the counters were actually read.
 - **Over SSH or headless**, WindowServer isn't running, so `WS%` stays 0 and the tool says so once.
 - **Counters are cumulative and reset on reboot.** A reset shows as zero rather than a negative spike.
 - **`WS%` resolution is one centisecond of CPU time**, because that is what `ps` reports. Over a 1-second interval that is 1% granularity, so an almost idle compositor reads near zero.
@@ -123,8 +124,8 @@ Exit codes: `0` finished · `1` bad usage · `3` not macOS, or a required tool i
 ## Tests
 
 ```bash
-bash test/parse.test.sh   # 29 unit tests on fixture text, no Mac needed
-bash test/cli.test.sh     # 17 end-to-end tests: runs the tool, checks every format
+bash test/parse.test.sh   # 40 unit tests on fixture text, no Mac needed
+bash test/cli.test.sh     # 22 end-to-end tests: runs the tool, checks every format
 ```
 
 The tool is one self-contained file whose parsing, rate arithmetic, classification and verdict functions come first, so the unit tests source it and feed them recorded `vm_stat` and `iostat` output, including the two-disk layout that shifts iostat's columns and both spellings of the decompression counter. Sourcing it never starts a sampling run.

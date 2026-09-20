@@ -45,55 +45,57 @@ parse_vm_stat  parse_iostat_busy   parse_cputime            now()
 ```
 
 Everything flows one way. The parsing and arithmetic functions are pure: text or numbers
-in, text out, no globals read, no commands run. Only the loop inside `main` touches the
-system, keeps state, or prints.
+in, text out, no globals read, no globals written, no commands run. Every working
+variable inside them is `local`, and the ones that carry a threshold or a tally are named
+apart from the loop's, so a second call site cannot quietly rewrite the run's
+configuration. Only the loop inside `main` touches the system, keeps state, or prints.
 
 ## The one file
 
-`bin/jitter-trace` is 420 lines. It is not a set of modules and this document will not
+`bin/jitter-trace` is 492 lines. It is not a set of modules and this document will not
 pretend otherwise. It is two halves: a library of pure functions at the top, and the tool
-that uses them below the `── the tool` comment at line 144.
+that uses them below the `── the tool` comment at line 161.
 
-### The pure half (lines 13–142)
+### The pure half (lines 13–159)
 
 | Function | Lines | Responsibility |
 |---|---|---|
-| `parse_vm_stat` | 21–29 | `vm_stat` text on stdin → `"decomp pagein swapin"` cumulative page counts |
-| `parse_iostat_busy` | 33–54 | `iostat -c` text on stdin → integer busy percent (`us` + `sy`), or empty |
-| `parse_cputime` | 57–65 | `"MM:SS.ss"` or `"HH:MM:SS.ss"` → seconds, to two decimals |
-| `delta` | 68–70 | `after - before`, floored at 0 so a reboot is not a negative spike |
-| `megabytes` | 72–74 | pages × page size → MB, three decimals |
-| `per_second` | 76–78 | amount ÷ seconds, three decimals, 0 when seconds is not positive |
-| `display_rate` | 82–89 | a rate → the shortest string that still shows it is non-zero |
-| `above` | 91–93 | exit status: is value strictly greater than limit |
-| `classify_sample` | 97–120 | four rates plus three limits → space-separated tags |
-| `summarize_verdict` | 123–142 | four event counts → one sentence naming the cause |
+| `parse_vm_stat` | 23–36 | `vm_stat` text on stdin → `"decomp pagein swapin"` cumulative page counts, `-` for a counter it could not find |
+| `parse_iostat_busy` | 40–61 | `iostat -c` text on stdin → integer busy percent (`us` + `sy`), or empty |
+| `parse_cputime` | 64–72 | `"MM:SS.ss"` or `"HH:MM:SS.ss"` → seconds, to two decimals |
+| `delta` | 75–77 | `after - before`, floored at 0 so a reboot is not a negative spike |
+| `megabytes` | 79–81 | pages × page size → MB, three decimals |
+| `per_second` | 83–85 | amount ÷ seconds, three decimals, 0 when seconds is not positive |
+| `display_rate` | 89–96 | a rate → the shortest string that still shows it is non-zero |
+| `above` | 98–100 | exit status: is value strictly greater than limit |
+| `classify_sample` | 106–129 | four rates plus three limits → space-separated tags |
+| `summarize_verdict` | 135–159 | four event counts, plus how many samples were unreadable → one sentence naming the cause |
 
-### The tool half (lines 144–420)
+### The tool half (lines 161–492)
 
 | Section | Lines | Responsibility |
 |---|---|---|
-| Defaults and settings | 146–159 | `DEFAULT_*` constants and the variables the options write to |
-| `usage` | 161–195 | The help text, including the column glossary and how to read it |
-| `die` | 197–200 | Message to stderr, exit with a code (default 1) |
-| `require_macos` | 202–207 | `uname -s` must be `Darwin` and `vm_stat` must exist, else exit 3 |
-| `positive_number`, `positive_integer` | 209–215 | Validators as exit statuses |
-| `require_number`, `require_integer` | 217–223 | The same, but they `die` with the option name |
-| `main` | 225–415 | Everything stateful — see below |
-| Source guard | 417–420 | `main "$@"` only when the file was executed, not sourced |
+| Defaults and settings | 163–176 | `DEFAULT_*` constants and the variables the options write to |
+| `usage` | 178–212 | The help text, including the column glossary and how to read it |
+| `die` | 214–217 | Message to stderr, exit with a code (default 1) |
+| `require_macos` | 222–230 | `uname -s` must be `Darwin`, and `vm_stat` and `awk` must exist, else exit 3 |
+| `positive_number`, `positive_integer` | 232–238 | Validators as exit statuses |
+| `require_number`, `require_integer` | 240–246 | The same, but they `die` with the option name |
+| `main` | 248–487 | Everything stateful — see below |
+| Source guard | 489–492 | `main "$@"` only when the file was executed, not sourced |
 
 `main` itself is another seven parts:
 
 | Part of `main` | Lines | Responsibility |
 |---|---|---|
-| Option parsing | 226–242 | A `while`/`case` loop; every value goes through a `require_*` first |
-| Preflight | 244–246 | `require_macos`, then `sysctl -n hw.pagesize` with a 4096 fallback |
-| `now` | 249–251 | Sub-second wall clock via `perl`, falling back to `date +%s` |
-| WindowServer plumbing | 253–264 | `pgrep -x WindowServer` once; `windowserver_seconds` reads its cumulative CPU time |
-| `cpu_busy_percent` | 266–272 | `iostat -c 2 -w 1` piped to `parse_iostat_busy`, or empty under `--no-cpu` |
-| Accumulators and `track_worst` | 274–289 | Event counts and the highest rate seen for each counter |
-| `print_summary`, traps | 291–327 | The closing summary, and the exit/interrupt handling that guarantees it |
-| Header and sample loop | 329–414 | The output header, then the loop |
+| Option parsing | 249–265 | A `while`/`case` loop; every value goes through a `require_*` first |
+| Preflight | 267–275 | `require_macos`, the sub-second-interval warning, then `sysctl -n hw.pagesize` with a 4096 fallback |
+| `now` | 277–279 | Sub-second wall clock via `perl`, falling back to `date +%s` |
+| WindowServer plumbing | 281–292 | `pgrep -x WindowServer` once; `windowserver_seconds` reads its cumulative CPU time |
+| `cpu_busy_percent` | 294–300 | `iostat -c 2 -w 1` piped to `parse_iostat_busy`, or empty under `--no-cpu` |
+| Accumulators and `track_worst` | 302–319 | Event counts and the highest rate seen for each counter |
+| `print_summary`, traps | 321–360 | The closing summary, and the exit/interrupt handling that guarantees it |
+| Header and sample loop | 362–486 | The output header, then the loop |
 
 The functions inside `main` are nested definitions: they do not exist until `main` runs.
 That is deliberate — see the source guard below.
@@ -107,8 +109,8 @@ between iterations is:
 previous_counters                "decomp pagein swapin"   (a single string, re-split)
 previous_windowserver_seconds    cumulative CPU-seconds
 previous_time                    wall clock, seconds with milliseconds
-started_at                       wall clock at the first sample
-sample_count
+started_at                       wall clock at the first reading, set inside the loop
+sample_count, unreadable_samples
 memory_events, disk_events, swap_events, compositor_events
 worst_decomp, worst_pagein, worst_swapin, worst_windowserver
 ```
@@ -140,9 +142,13 @@ elapsed="$(awk -v a="$previous_time" -v b="$time_now" -v fallback="$interval" \
   'BEGIN { e = b - a; print (e > 0.05) ? e : fallback }')"
 ```
 
+An interval shorter than the `iostat` wait therefore cannot be honoured at all while
+`CPU%` is measured, so `main` says so on stderr before sampling starts rather than letting
+`--interval 0.2` quietly mean one second.
+
 This matters because an iteration takes longer than it sleeps. `iostat -c 2 -w 1` blocks
 for about a second, `vm_stat`, `ps` and `pgrep` each cost a few milliseconds, and the loop
-only sleeps `interval - CPU_SAMPLE_SECONDS` (lines 409–413) to compensate. The result is
+only sleeps `interval - CPU_SAMPLE_SECONDS` (lines 479–485) to compensate. The result is
 close to the requested interval but never exact, and using the nominal interval as the
 divisor would bias every rate. The `0.05` floor exists so that a clock that went backwards,
 or a `now()` that fell back to whole-second `date`, cannot produce a division by something
@@ -154,9 +160,15 @@ tiny and report an absurd rate.
 
 **The first sample prints nothing.** A single reading of a cumulative counter says nothing
 about the last second. The loop reads, stores into `previous_counters`, and only produces
-a row once `previous_counters` is non-empty (line 355). So `--samples 2` performs three
+a row once `previous_counters` is non-empty (line 437). So `--samples 2` performs three
 `vm_stat` reads and prints two rows, and the `TIME` column is the time of the *end* of the
 interval.
+
+**`--duration` is measured from the first reading.** `started_at` is empty until the loop
+takes it, so the clock starts when sampling starts rather than before the setup that
+precedes it. Setting it earlier cost a whole iteration of the requested run, which with
+`iostat` in the loop is about a second: `--duration 3 --interval 1` printed two rows
+instead of three.
 
 **A reset reads as zero, not as a negative.** `delta` floors at zero:
 
@@ -178,7 +190,7 @@ constant that says nothing about the last second.
 Every counter has a "cannot tell" answer distinct from "nothing happened".
 
 - `parse_iostat_busy` prints the **empty string** when it finds no header, or when the
-  cells where `us` and `sy` should be do not look like numbers (lines 45 and 50). It never
+  cells where `us` and `sy` should be do not look like numbers (lines 52 and 57). It never
   prints `0`, because reporting an idle CPU when `iostat` is missing or has changed its
   format would invent the very evidence the tool exists to supply. The empty value then
   renders as `-` in the table (`${cpu_percent:--}`), as an empty field in CSV, and as
@@ -187,13 +199,19 @@ Every counter has a "cannot tell" answer distinct from "nothing happened".
   not two.
 - No WindowServer process (headless, or over SSH) means `windowserver_seconds` returns a
   literal `0` and the tool says so **once**, on stderr, before the run starts (lines
-  254–256). A warning per sample would drown the table.
-- `parse_vm_stat` is the exception: unrecognised input yields `0 0 0`, via `print decomp +
-  0` on unset awk variables. That is a genuine asymmetry — see the limitations below.
+  282–284). A warning per sample would drown the table.
+- `parse_vm_stat` prints `-` for a counter it did not find, never `0`. A sample with any
+  unknown counter computes no deltas and no rates: it renders `-`, empty and `null` by the
+  same three paths the CPU column uses, is counted in `unreadable_samples`, warns once on
+  stderr, and clears `previous_counters` so the next sample is not differenced against a
+  reading that was never taken. The verdict then says nothing was measured rather than
+  that nothing happened — the one wrong answer this tool must never give.
 
-`require_macos` only guarantees `vm_stat`. Everything else degrades: no `iostat` gives a
-`-` CPU column, no `perl` falls back to whole-second timing, no `sysctl` assumes a 4 KiB
-page. The tool still answers the question it was opened for.
+`require_macos` guarantees `vm_stat` and `awk`: the first is every counter, the second is
+every calculation, and neither has a fallback. Everything else degrades: no `iostat` gives
+a `-` CPU column, no `ps` or `pgrep` leaves `WS%` at 0, no `perl` falls back to
+whole-second timing, no `sysctl` assumes a 4 KiB page. The tool still answers the question
+it was opened for.
 
 ## Parsing, in detail
 
@@ -217,8 +235,10 @@ Three things are going on.
   a bare `/Decompressions:/` would match both and the last one read would win.
 
 The trailing full stop on every `vm_stat` number is stripped with `gsub`. The `END` block
-adds `+ 0` so an absent counter prints `0` rather than an empty field, which keeps the
-output a stable three fields for `read -r` to consume.
+substitutes `-` for any counter no pattern matched, which keeps the output a stable three
+fields for `read -r` to consume while still saying that the field is unknown. A literal
+`0` there would be a lie in exactly the case the two patterns above exist to prevent: a
+counter renamed again, reported as a healthy machine.
 
 ### `iostat`
 
@@ -256,7 +276,7 @@ that is 1% granularity on `WS%`, so a nearly idle compositor reads as a flat `0.
 
 ## A worked trace: one sample becomes one row
 
-Starting at line 344, with `previous_counters` already populated:
+Starting at line 379, with `previous_counters` already populated:
 
 ```
 read -r decomp pagein swapin <<< "$(vm_stat | parse_vm_stat)"
@@ -310,16 +330,16 @@ any indirection that would replace them.
 
 | Format | Sample rows | Summary | Notes |
 |---|---|---|---|
-| `table` (default) | stdout, fixed-width columns | **stderr** | Unknown CPU renders `-` |
+| `table` (default) | stdout, fixed-width columns | **stderr** | Unknown CPU or page counter renders `-` |
 | `--csv` | stdout, 10 columns, header row | **stderr** | Tags joined with `;` via `tr -s ' ' ';' \| sed 's/;$//'` |
-| `--json` | stdout, one object per line | **stdout**, `"type":"summary"` | Unknown CPU renders `null` |
+| `--json` | stdout, one object per line | **stdout**, `"type":"summary"` | Unknown CPU or page counter renders `null` |
 
 The split matters. For `table` and `csv` the summary goes to stderr, so
 `jitter-trace --csv > jitter.csv` writes a clean parseable file and the verdict still
 appears on the terminal. For `--json` the summary goes to stdout instead, because it is
 itself a JSON object and a consumer doing `jitter-trace --json | jq` wants it in the
 stream. That is why `print_summary` branches on the format before anything else
-(lines 293–298).
+(lines 322–330).
 
 CSV and JSON carry both the raw page deltas and the computed MB/s rates. The table shows
 pages only, and puts the rates inside the tag text where they are needed for judgement.
@@ -330,13 +350,15 @@ pages only, and puts the rates inside the tag text where they are needed for jud
 |---|---|
 | Unknown option | `die "unknown option: ..."` → stderr, exit 1 |
 | Bad option value | `require_number` / `require_integer` → exit 1, naming the option and the value |
-| Not macOS, or no `vm_stat` | `require_macos` → exit 3 |
+| Not macOS, or no `vm_stat` or `awk` | `require_macos` → exit 3 |
 | No WindowServer | One line on stderr at startup, `WS%` stays `0` |
 | `iostat` missing or unparseable | CPU column becomes `-` / empty / `null` |
+| `vm_stat` counters unrecognised | One line on stderr, `-` columns, counted in `unreadable_samples`, and the verdict says nothing was measured |
+| `--interval` below the `iostat` wait, without `--no-cpu` | One line on stderr before sampling starts |
 | Counter reset | `delta` returns 0 for that sample |
 | Ctrl-C or `SIGTERM` | `finish` → `exit 0` → the `EXIT` trap prints the summary |
 
-The two traps at lines 326–327 are the whole story of "Ctrl-C still gives you an answer":
+The two traps at lines 359–360 are the whole story of "Ctrl-C still gives you an answer":
 
 ```bash
 trap finish INT TERM
@@ -371,7 +393,7 @@ sampling.
 
 That guard is what makes `test/parse.test.sh` possible. It sources the tool and calls
 `parse_vm_stat`, `classify_sample` and the rest directly against recorded fixture text —
-29 assertions in milliseconds, on any machine, with no Mac and no waiting for real
+40 assertions in milliseconds, on any machine, with no Mac and no waiting for real
 counters to move. Without it, testing the iostat column logic would mean owning a machine
 with two disks attached.
 
@@ -405,8 +427,8 @@ isolation, so nesting them keeps the sourced surface to exactly the part that is
 
 | File | Covers | Needs a Mac |
 |---|---|---|
-| `test/parse.test.sh` | 29 assertions on the pure functions, against fixture text | No |
-| `test/cli.test.sh` | 17 assertions: runs the real binary, checks every format and exit code | Yes, mostly |
+| `test/parse.test.sh` | 40 assertions on the pure functions, against fixture text | No |
+| `test/cli.test.sh` | 22 assertions: runs the real binary, checks every format and exit code | Yes, mostly |
 
 ```bash
 bash test/parse.test.sh
@@ -449,14 +471,14 @@ that can be separated from what it versions will be.
 
 | To change | Edit |
 |---|---|
-| A counter's name across macOS versions | `parse_vm_stat`, lines 21–29 — add a pattern, do not replace one |
-| How the CPU percent is read | `parse_iostat_busy`, lines 33–54, and `cpu_busy_percent`, 266–272 |
-| What counts as a stall | `DEFAULT_*` at lines 147–149, and the `above` calls in `classify_sample` |
-| A new tag | `classify_sample`, then a `case` arm in the loop at 366–377, then `summarize_verdict` |
-| The advice text | `summarize_verdict`, lines 123–142 |
-| A column | The three `printf` calls at 382–396, plus the headers at 329–336, plus `usage` |
-| A new option | The `case` in `main` at 227–240, plus `usage`, plus the README options table |
-| Sampling cadence | Lines 408–413, and `CPU_SAMPLE_SECONDS` at 150 |
+| A counter's name across macOS versions | `parse_vm_stat`, lines 23–36 — add a pattern, do not replace one |
+| How the CPU percent is read | `parse_iostat_busy`, lines 40–61, and `cpu_busy_percent`, 294–300 |
+| What counts as a stall | `DEFAULT_*` at lines 164–166, and the `above` calls in `classify_sample` |
+| A new tag | `classify_sample`, then a `case` arm in the loop at 425–436, then `summarize_verdict` |
+| The advice text | `summarize_verdict`, lines 135–159 |
+| A column | The three `printf` calls at 445–465, plus the headers at 362–369, plus `usage` |
+| A new option | The `case` in `main` at 250–263, plus `usage`, plus the README options table |
+| Sampling cadence | Lines 479–485, and `CPU_SAMPLE_SECONDS` at 167 |
 
 Anything added to the pure half should get a fixture-based assertion in
 `test/parse.test.sh`; anything added to the loop is only reachable from
